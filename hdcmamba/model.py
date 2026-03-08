@@ -693,6 +693,10 @@ class HdcMamba9v3Block(nn.Module):
         )
         del projs, gate, y_ssm, y_ssm_flat, x_conv, y_slot
 
+        combined = combined.float()
+        combined = torch.nan_to_num(combined, nan=0.0, posinf=65500.0, neginf=-65500.0)
+        combined = combined.to(x.dtype)
+
         result = self.out_proj(combined)
         del combined
         return result
