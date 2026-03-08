@@ -10,7 +10,7 @@ import wandb
 from tqdm import tqdm
 
 # ⚡ 사용자 정의 HdcMamba 모델 임포트
-from hdc_mamba_9_full import HdcMamba9v3Model
+from hdcmamba import HdcMamba9v3Model
 
 # (선택) 비교군 모델 라이브러리 (설치된 경우에만 동작하도록 예외 처리)
 try:
