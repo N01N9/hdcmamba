@@ -381,10 +381,11 @@ class HdcMamba9v3Block(nn.Module):
         
         # ⚡ [Stability Safeguard] Clamp combined values to prevent Inf/NaN
         combined = combined.float()
-        combined = torch.nan_to_num(combined, nan=0.0, posinf=1000.0, neginf=-1000.0)
-        combined = torch.clamp(combined, min=-1000.0, max=1000.0).to(x.dtype)
-        
-        result = self.out_proj(combined)
+        combined = torch.nan_to_num(combined, nan=0.0, posinf=1e4, neginf=-1e4) # ⚡ 1000에서 10000으로 확장
+        combined = torch.clamp(combined, min=-1e4, max=1e4) 
+
+        # ⚡ [중요 추가] out_proj 직전에 Residual 정보를 더 잘 살려줍니다.
+        result = self.out_proj(combined.to(x.dtype))
         return result
 
     def forward(self, x):
