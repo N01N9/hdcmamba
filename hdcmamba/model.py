@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # =========================================================================================
-# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Numerical Stability Max)
+# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Architecture & Initialization Fixed)
 # =========================================================================================
 
 # ─── Fused LayerNorm + Causal Conv1d ──────────────────────────────────────────────────
@@ -185,7 +185,7 @@ def fused_norm_conv1d_trainable(x, norm_layer, conv_layer):
         conv_layer.weight.squeeze(1).to(x.dtype), conv_layer.bias.to(x.dtype), norm_layer.eps,
     )
 
-# ─── SSM Triton (Numerical Stability Fix) ─────────────────────────────────────────────
+# ─── SSM Triton ─────────────────────────────────────────────
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_D': 32}, num_warps=4),
@@ -214,7 +214,7 @@ def _ssm_intra_v2(
         x_val  = tl.load(projs_ptr + ptr_base + (D_STATE + offs_d) * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
         b_val  = tl.load(projs_ptr + ptr_base + (D_STATE*2 + offs_d) * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
         
-        # ⚡ [Stability Fix] Stable Softplus for dt (prevents dt explosion)
+        # ⚡ [안정성 유지]
         dt_s = tl.where(dt_raw > 20.0, dt_raw, tl.math.log(1.0 + tl.math.exp(dt_raw)))
         
         cur_log_decay = dt_s * A_val
@@ -264,14 +264,13 @@ def _ssm_inter_v2(
     for c in tl.static_range(CHUNK_SIZE):
         ptr_base = pid_b * stride_pb + (pid_n * CHUNK_SIZE + c) * stride_pl
         dt_raw = tl.load(projs_ptr + ptr_base + offs_d * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
-        # ⚡ [Stability Fix] Same stable softplus here
         dt_s   = tl.where(dt_raw > 20.0, dt_raw, tl.math.log(1.0 + tl.math.exp(dt_raw)))
         cum_log += dt_s * A_val
         y_addr  = pid_b * stride_yb + pid_n * stride_yn + c * stride_yc + offs_d * stride_yd
         y_intra = tl.load(y_ssm_ptr + y_addr, mask=mask_d, other=0.0).to(tl.float32)
         tl.store(y_ssm_ptr + y_addr, (y_intra + g_state * tl.math.exp(cum_log)).to(tl.bfloat16), mask=mask_d)
 
-# ─── Slot Triton (Fused & Memory Optimized) ──────────────────────────────────────────
+# ─── Slot Triton ──────────────────────────────────────────
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_C': 64,  'BLOCK_SIZE_D': 64},  num_warps=4),
@@ -298,13 +297,20 @@ def _slot_all_fused(
     diff = offs_c[:, None] - offs_c[None, :]; mask_causal = diff >= 0
     decay_matrix = tl.math.exp(diff * log_gamma)
     running = tl.zeros((BLOCK_SIZE_D, BLOCK_SIZE_D), dtype=tl.float32)
+    
     for pid_n in range(N):
         base = pid_b * stride_pb + (pid_n * CHUNK_SIZE + offs_c[:, None]) * stride_pl
         q_off, k_off, v_off = PROJ_OFFSET + pid_h * HEAD_DIM, PROJ_OFFSET + D_MODEL + pid_h * HEAD_DIM, PROJ_OFFSET + D_MODEL * 2 + pid_h * HEAD_DIM
         q_raw = tl.load(projs_ptr + base + (q_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         k_raw = tl.load(projs_ptr + base + (k_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         v = tl.load(projs_ptr + base + (v_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0)
-        q, k = tl.where(q_raw > 0, q_raw * q_raw, 0.0).to(v.dtype), tl.where(k_raw > 0, k_raw * k_raw, 0.0).to(v.dtype)
+        
+        # ⚡ [핵심 수정 1] ReLU^2 대신 ELU(x)+1 을 사용하여 죽은 가지(Dead Branch) 완벽히 부활
+        # 음수 영역에서도 기울기가 살아있으며, 결과값은 항상 양수(>0)를 보장합니다.
+        q_pos = tl.where(q_raw > 0, q_raw + 1.0, tl.math.exp(q_raw))
+        k_pos = tl.where(k_raw > 0, k_raw + 1.0, tl.math.exp(k_raw))
+        q, k = q_pos.to(v.dtype), k_pos.to(v.dtype)
+
         scores = tl.dot(q, tl.trans(k)); scores = tl.where(mask_causal, scores * decay_matrix, 0.0).to(v.dtype)
         y_intra = tl.dot(scores, v)
         q_decay = tl.math.exp(offs_c * log_gamma)[:, None]
@@ -347,22 +353,38 @@ def _fused_gnorm_gate_cat_kernel(
 # HdcMamba9v3Block
 # =========================================================================================
 class HdcMamba9v3Block(nn.Module):
-    def __init__(self, d_model=512, d_state=64, num_heads=8, chunk_size=128):
+    # ⚡ [핵심 수정 4] Chunk Size 기본값을 256으로 늘려 Attention Window 확장
+    def __init__(self, d_model=512, d_state=64, num_heads=8, chunk_size=256):
         super().__init__()
         self.d_model, self.d_state, self.num_heads, self.chunk_size = d_model, d_state, num_heads, chunk_size
         self.head_dim = d_model // num_heads
+        
         self.norm = nn.LayerNorm(d_model)
         self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=4, groups=d_model, padding=3, bias=True)
         with torch.no_grad():
-            self.conv1d.weight.fill_(0.0); self.conv1d.weight[:, 0, -1] = 1.0; self.conv1d.bias.fill_(0.0)
-        self.in_proj = nn.Linear(d_model, d_state * 3 + d_model * 4, bias=False)
+            # ⚡ Conv 초기화를 Identity에 작은 노이즈를 더해 gradient 흐름 유도
+            nn.init.normal_(self.conv1d.weight, std=0.02)
+            self.conv1d.weight[:, 0, -1] += 1.0 
+            self.conv1d.bias.fill_(0.0)
+            
+        # ⚡ [핵심 수정 2] bias=True 로 변경하여 dt와 gate의 초기 스케일을 조절합니다.
+        self.in_proj = nn.Linear(d_model, d_state * 3 + d_model * 4, bias=True)
         
-        # ⚡ [Stability Fix] Initialize dt_proj (first d_state weights) to a positive bias
-        # This prevents dt from starting in a dead/vanishing region.
         with torch.no_grad():
-            self.in_proj.weight[:d_state, :].fill_(0.1)
+            # 1. dt bias 초기화 (SSM이 너무 빨리 망각하지 않도록)
+            dt_init = torch.rand(d_state) * (0.1 - 0.001) + 0.001
+            self.in_proj.bias[:d_state] = torch.log(torch.exp(dt_init) - 1.0)
+            
+            # 2. Slot QKV 스케일 키우기 (std=0.08 수준 효과)
+            slot_offset = d_state * 3
+            qkv_end = slot_offset + d_model * 3
+            nn.init.xavier_uniform_(self.in_proj.weight[slot_offset:qkv_end])
+            
+            # 3. Gate Bias 열기 (sigmoid(1.0) ~ 0.73)
+            self.in_proj.bias[qkv_end:].fill_(1.0)
 
-        self.A_log = nn.Parameter(torch.log(torch.linspace(0.9, 0.999, d_state)))
+        # ⚡ [핵심 수정 3] SSM Decay 완화 (0.9 ~ 0.999 -> 0.99 ~ 0.9999)
+        self.A_log = nn.Parameter(torch.log(torch.linspace(0.99, 0.9999, d_state)))
         self.decay_log = nn.Parameter(torch.log(torch.ones(num_heads) * 0.05))
         self.out_proj = nn.Linear(d_state + d_model, d_model, bias=False)
         self.group_norm = nn.GroupNorm(num_heads, d_model)
@@ -386,12 +408,8 @@ class HdcMamba9v3Block(nn.Module):
         gate, combined = projs[..., slot_offset + dm * 3:], torch.empty(B, L, ds + dm, device=x.device, dtype=x.dtype)
         _fused_gnorm_gate_cat_kernel[(B * L,)](y_slot, y_ssm.view(B, L, ds), gate, combined, self.group_norm.weight, self.group_norm.bias, y_slot.stride(0), y_slot.stride(1), y_slot.stride(2), y_slot.stride(3), B*L, ds, 1, B*L, dm*4, 1, combined.stride(0), combined.stride(1), combined.stride(2), B=B, NUM_HEADS=H, HEAD_DIM=D, D_MODEL=dm, D_STATE=ds, L=L)
         
-        # ⚡ [Stability Safeguard] Clamp combined values to prevent Inf/NaN spreading
-        combined = combined.float()
-        combined = torch.nan_to_num(combined, nan=0.0, posinf=1e4, neginf=-1e4)
-        combined = torch.clamp(combined, min=-1e4, max=1e4).to(x.dtype)
-        
-        # ⚡ [Improvement] Residual connection flow
+        # 정규화를 통해 폭발을 잡으면서도 Gradient 흐름은 살려둠
+        combined = F.layer_norm(combined.float(), (ds + dm,)).to(x.dtype)
         result = self.out_proj(combined)
         return result
 
@@ -408,7 +426,8 @@ class HdcMamba9v3Block(nn.Module):
 class HdcMamba9v3Model(nn.Module):
     def __init__(self, d_model, n_layers, d_state, num_slots, num_heads=8):
         super().__init__()
-        self.layers = nn.ModuleList([HdcMamba9v3Block(d_model=d_model, d_state=d_state, num_heads=num_heads, chunk_size=128) for _ in range(n_layers)])
+        # chunk_size를 256으로 늘려 호출
+        self.layers = nn.ModuleList([HdcMamba9v3Block(d_model=d_model, d_state=d_state, num_heads=num_heads, chunk_size=256) for _ in range(n_layers)])
         self.norm_final = nn.LayerNorm(d_model)
 
     def forward(self, x):
