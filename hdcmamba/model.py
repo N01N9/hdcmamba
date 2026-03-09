@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # =========================================================================================
-# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Numerical Stability Enhanced)
+# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Numerical Stability Max)
 # =========================================================================================
 
 # ─── Fused LayerNorm + Causal Conv1d ──────────────────────────────────────────────────
@@ -214,7 +214,7 @@ def _ssm_intra_v2(
         x_val  = tl.load(projs_ptr + ptr_base + (D_STATE + offs_d) * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
         b_val  = tl.load(projs_ptr + ptr_base + (D_STATE*2 + offs_d) * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
         
-        # ⚡ [Stability Fix] Stable Softplus for dt
+        # ⚡ [Stability Fix] Stable Softplus for dt (prevents dt explosion)
         dt_s = tl.where(dt_raw > 20.0, dt_raw, tl.math.log(1.0 + tl.math.exp(dt_raw)))
         
         cur_log_decay = dt_s * A_val
@@ -264,6 +264,7 @@ def _ssm_inter_v2(
     for c in tl.static_range(CHUNK_SIZE):
         ptr_base = pid_b * stride_pb + (pid_n * CHUNK_SIZE + c) * stride_pl
         dt_raw = tl.load(projs_ptr + ptr_base + offs_d * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
+        # ⚡ [Stability Fix] Same stable softplus here
         dt_s   = tl.where(dt_raw > 20.0, dt_raw, tl.math.log(1.0 + tl.math.exp(dt_raw)))
         cum_log += dt_s * A_val
         y_addr  = pid_b * stride_yb + pid_n * stride_yn + c * stride_yc + offs_d * stride_yd
@@ -355,6 +356,12 @@ class HdcMamba9v3Block(nn.Module):
         with torch.no_grad():
             self.conv1d.weight.fill_(0.0); self.conv1d.weight[:, 0, -1] = 1.0; self.conv1d.bias.fill_(0.0)
         self.in_proj = nn.Linear(d_model, d_state * 3 + d_model * 4, bias=False)
+        
+        # ⚡ [Stability Fix] Initialize dt_proj (first d_state weights) to a positive bias
+        # This prevents dt from starting in a dead/vanishing region.
+        with torch.no_grad():
+            self.in_proj.weight[:d_state, :].fill_(0.1)
+
         self.A_log = nn.Parameter(torch.log(torch.linspace(0.9, 0.999, d_state)))
         self.decay_log = nn.Parameter(torch.log(torch.ones(num_heads) * 0.05))
         self.out_proj = nn.Linear(d_state + d_model, d_model, bias=False)
@@ -379,13 +386,13 @@ class HdcMamba9v3Block(nn.Module):
         gate, combined = projs[..., slot_offset + dm * 3:], torch.empty(B, L, ds + dm, device=x.device, dtype=x.dtype)
         _fused_gnorm_gate_cat_kernel[(B * L,)](y_slot, y_ssm.view(B, L, ds), gate, combined, self.group_norm.weight, self.group_norm.bias, y_slot.stride(0), y_slot.stride(1), y_slot.stride(2), y_slot.stride(3), B*L, ds, 1, B*L, dm*4, 1, combined.stride(0), combined.stride(1), combined.stride(2), B=B, NUM_HEADS=H, HEAD_DIM=D, D_MODEL=dm, D_STATE=ds, L=L)
         
-        # ⚡ [Stability Safeguard] Clamp combined values to prevent Inf/NaN
+        # ⚡ [Stability Safeguard] Clamp combined values to prevent Inf/NaN spreading
         combined = combined.float()
-        combined = torch.nan_to_num(combined, nan=0.0, posinf=1e4, neginf=-1e4) # ⚡ 1000에서 10000으로 확장
-        combined = torch.clamp(combined, min=-1e4, max=1e4) 
-
-        # ⚡ [중요 추가] out_proj 직전에 Residual 정보를 더 잘 살려줍니다.
-        result = self.out_proj(combined.to(x.dtype))
+        combined = torch.nan_to_num(combined, nan=0.0, posinf=1e4, neginf=-1e4)
+        combined = torch.clamp(combined, min=-1e4, max=1e4).to(x.dtype)
+        
+        # ⚡ [Improvement] Residual connection flow
+        result = self.out_proj(combined)
         return result
 
     def forward(self, x):
