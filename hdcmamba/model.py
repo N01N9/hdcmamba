@@ -6,46 +6,19 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # =========================================================================================
-# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Deadlock Fixed with Heuristic Branching)
+# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, PTXAS Deadlock Fixed, Max Speed)
 # =========================================================================================
 
-# ─── 하드웨어 정보 획득 도구 ────────────────────────────────────────────────────────
 def get_optimal_triton_config(d_state, head_dim):
-    """
-    GPU의 연산 능력(Compute Capability)을 기반으로 안전하고 최적화된
-    Triton 블록 크기 및 워프 수를 반환합니다.
-    """
     if not torch.cuda.is_available():
         return {"block_d": 64, "block_c": 128, "warps": 4}
-    
-    cc_major, cc_minor = torch.cuda.get_device_capability()
-    
-    # A100 (Ampere, CC 8.0) 또는 H100 (Hopper, CC 9.0) 등 고성능 GPU
+    cc_major, _ = torch.cuda.get_device_capability()
     if cc_major >= 8:
-        return {
-            "ssm_block_d": max(64, triton.next_power_of_2(d_state)),
-            "ssm_warps": 8,
-            "slot_block_c": 128,
-            "slot_block_d": max(64, triton.next_power_of_2(head_dim)),
-            "slot_warps": 8,
-            "out_block_d_state": max(64, triton.next_power_of_2(d_state)),
-            "out_block_d_head": max(64, triton.next_power_of_2(head_dim)),
-            "out_warps": 8
-        }
-    # T4, V100, RTX 20/30 series 등 (안정성 위주)
+        return {"ssm_block_d": max(64, triton.next_power_of_2(d_state)), "ssm_warps": 8, "slot_block_c": 128, "slot_block_d": max(64, triton.next_power_of_2(head_dim)), "slot_warps": 8, "out_block_d_state": max(64, triton.next_power_of_2(d_state)), "out_block_d_head": max(64, triton.next_power_of_2(head_dim)), "out_warps": 8}
     else:
-        return {
-            "ssm_block_d": max(32, triton.next_power_of_2(d_state)),
-            "ssm_warps": 4,
-            "slot_block_c": 64,
-            "slot_block_d": max(32, triton.next_power_of_2(head_dim)),
-            "slot_warps": 4,
-            "out_block_d_state": max(32, triton.next_power_of_2(d_state)),
-            "out_block_d_head": max(32, triton.next_power_of_2(head_dim)),
-            "out_warps": 4
-        }
+        return {"ssm_block_d": max(32, triton.next_power_of_2(d_state)), "ssm_warps": 4, "slot_block_c": 64, "slot_block_d": max(32, triton.next_power_of_2(head_dim)), "slot_warps": 4, "out_block_d_state": max(32, triton.next_power_of_2(d_state)), "out_block_d_head": max(32, triton.next_power_of_2(head_dim)), "out_warps": 4}
 
-# ─── Fused LayerNorm + Causal Conv1d (변경 없음) ───────────────────────────────────
+# ─── Fused LayerNorm + Causal Conv1d (부활!) ──────────────────────────────────────────
 @triton.jit
 def _fused_norm_conv_fwd_kernel(
     x_ptr, norm_w_ptr, norm_b_ptr, conv_w_ptr, conv_b_ptr,
@@ -55,10 +28,8 @@ def _fused_norm_conv_fwd_kernel(
     stride_ob, stride_ol, stride_od,
     eps: tl.constexpr, BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
-    pid_l = tl.program_id(1)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
+    pid_b = tl.program_id(0); pid_l = tl.program_id(1)
+    offs_d = tl.arange(0, BLOCK_D); mask_d = offs_d < D
     x_base   = x_ptr   + pid_b * stride_xb
     out_base = out_ptr + pid_b * stride_ob
     m_base   = mean_ptr + pid_b * L
@@ -71,14 +42,12 @@ def _fused_norm_conv_fwd_kernel(
     cw3 = tl.load(conv_w_ptr + offs_d*4 + 3, mask=mask_d, other=0.0).to(tl.float32)
     cb  = tl.load(conv_b_ptr + offs_d,       mask=mask_d, other=0.0).to(tl.float32)
     start_l = pid_l * BLOCK_L
-    np3 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    np2 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    np1 = tl.zeros([BLOCK_D], dtype=tl.float32)
+    np3, np2, np1 = tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32)
+    
     for past_i in tl.static_range(3):
         t_p   = start_l - 3 + past_i
         valid = (t_p >= 0) & (t_p < L)
-        xp    = tl.load(x_base + t_p * stride_xl + offs_d * stride_xd,
-                        mask=mask_d & valid, other=0.0).to(tl.float32)
+        xp    = tl.load(x_base + t_p * stride_xl + offs_d * stride_xd, mask=mask_d & valid, other=0.0).to(tl.float32)
         mean_p = tl.sum(xp, axis=0) / D
         xcp    = tl.where(mask_d, xp - mean_p, 0.0)
         var_p  = tl.sum(xcp * xcp, axis=0) / D
@@ -86,11 +55,11 @@ def _fused_norm_conv_fwd_kernel(
         if past_i == 0: np3 = nxp
         elif past_i == 1: np2 = nxp
         else: np1 = nxp
+
     for i in range(BLOCK_L):
         t = start_l + i
         if t < L:
-            xc     = tl.load(x_base + t * stride_xl + offs_d * stride_xd,
-                              mask=mask_d, other=0.0).to(tl.float32)
+            xc     = tl.load(x_base + t * stride_xl + offs_d * stride_xd, mask=mask_d, other=0.0).to(tl.float32)
             mean_c = tl.sum(xc, axis=0) / D
             xcc    = tl.where(mask_d, xc - mean_c, 0.0)
             var_c  = tl.sum(xcc * xcc, axis=0) / D
@@ -99,23 +68,19 @@ def _fused_norm_conv_fwd_kernel(
             tl.store(r_base + t, rstd_c)
             np0  = (xcc * rstd_c) * nw + nb
             out  = np3 * cw0 + np2 * cw1 + np1 * cw2 + np0 * cw3 + cb
-            tl.store(out_base + t * stride_ol + offs_d * stride_od,
-                     out.to(out_ptr.dtype.element_ty), mask=mask_d)
+            tl.store(out_base + t * stride_ol + offs_d * stride_od, out.to(out_ptr.dtype.element_ty), mask=mask_d)
             np3 = np2; np2 = np1; np1 = np0
 
 @triton.jit
 def _fused_norm_conv_bwd_kernel(
     grad_out_ptr, x_ptr, mean_ptr, rstd_ptr,
-    norm_w_ptr, conv_w_ptr,
-    dx_ptr, dnorm_w_ptr, dnorm_b_ptr, dconv_w_ptr, dconv_b_ptr,
+    norm_w_ptr, conv_w_ptr, dx_ptr, dnorm_w_ptr, dnorm_b_ptr, dconv_w_ptr, dconv_b_ptr,
     B, L, D,
     stride_xb, stride_xl, stride_xd,
     BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
-    pid_l = tl.program_id(1)
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
+    pid_b = tl.program_id(0); pid_l = tl.program_id(1)
+    offs_d = tl.arange(0, BLOCK_D); mask_d = offs_d < D
     x_base  = x_ptr        + pid_b * stride_xb
     go_base = grad_out_ptr + pid_b * stride_xb
     dx_base = dx_ptr       + pid_b * stride_xb
@@ -125,13 +90,9 @@ def _fused_norm_conv_bwd_kernel(
     cw2 = tl.load(conv_w_ptr + offs_d*4 + 2, mask=mask_d, other=0.0).to(tl.float32)
     cw3 = tl.load(conv_w_ptr + offs_d*4 + 3, mask=mask_d, other=0.0).to(tl.float32)
     start_l = pid_l * BLOCK_L
-    d_nw  = tl.zeros([BLOCK_D], dtype=tl.float32)
-    d_nb  = tl.zeros([BLOCK_D], dtype=tl.float32)
-    d_cw0 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    d_cw1 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    d_cw2 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    d_cw3 = tl.zeros([BLOCK_D], dtype=tl.float32)
-    d_cb  = tl.zeros([BLOCK_D], dtype=tl.float32)
+    d_nw, d_nb, d_cb = tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32)
+    d_cw0, d_cw1, d_cw2, d_cw3 = tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32), tl.zeros([BLOCK_D], dtype=tl.float32)
+    
     for i in range(BLOCK_L):
         t = start_l + i
         if t >= L: continue
@@ -145,36 +106,22 @@ def _fused_norm_conv_bwd_kernel(
         rstd_c = tl.load(rstd_ptr + pid_b * L + t)
         x_hat  = (xc - mean_c) * rstd_c
         dx_hat = dx_norm * nw
-        dx_hat_sum    = tl.sum(dx_hat, axis=0)
-        dx_hat_xhat_s = tl.sum(dx_hat * x_hat, axis=0)
-        dx = rstd_c * (dx_hat - dx_hat_sum / D - x_hat * (dx_hat_xhat_s / D))
+        dx = rstd_c * (dx_hat - tl.sum(dx_hat, axis=0) / D - x_hat * (tl.sum(dx_hat * x_hat, axis=0) / D))
         tl.store(dx_base + t * stride_xl + offs_d * stride_xd, dx.to(dx_ptr.dtype.element_ty), mask=mask_d)
-        d_nw  += dx_norm * x_hat
-        d_nb  += dx_norm
-        d_cb  += go0
-        d_cw3 += go0 * x_hat * nw
+        d_nw  += dx_norm * x_hat; d_nb  += dx_norm; d_cb  += go0; d_cw3 += go0 * x_hat * nw
         if t - 1 >= 0:
             xp1 = tl.load(x_base + (t-1)*stride_xl + offs_d*stride_xd, mask=mask_d, other=0.0).to(tl.float32)
-            mp1 = tl.load(mean_ptr + pid_b * L + t - 1)
-            rp1 = tl.load(rstd_ptr + pid_b * L + t - 1)
-            d_cw2 += go0 * ((xp1 - mp1) * rp1) * nw
+            d_cw2 += go0 * ((xp1 - tl.load(mean_ptr + pid_b * L + t - 1)) * tl.load(rstd_ptr + pid_b * L + t - 1)) * nw
         if t - 2 >= 0:
             xp2 = tl.load(x_base + (t-2)*stride_xl + offs_d*stride_xd, mask=mask_d, other=0.0).to(tl.float32)
-            mp2 = tl.load(mean_ptr + pid_b * L + t - 2)
-            rp2 = tl.load(rstd_ptr + pid_b * L + t - 2)
-            d_cw1 += go0 * ((xp2 - mp2) * rp2) * nw
+            d_cw1 += go0 * ((xp2 - tl.load(mean_ptr + pid_b * L + t - 2)) * tl.load(rstd_ptr + pid_b * L + t - 2)) * nw
         if t - 3 >= 0:
             xp3 = tl.load(x_base + (t-3)*stride_xl + offs_d*stride_xd, mask=mask_d, other=0.0).to(tl.float32)
-            mp3 = tl.load(mean_ptr + pid_b * L + t - 3)
-            rp3 = tl.load(rstd_ptr + pid_b * L + t - 3)
-            d_cw0 += go0 * ((xp3 - mp3) * rp3) * nw
-    tl.atomic_add(dnorm_w_ptr + offs_d,       d_nw,  mask=mask_d)
-    tl.atomic_add(dnorm_b_ptr + offs_d,       d_nb,  mask=mask_d)
-    tl.atomic_add(dconv_w_ptr + offs_d*4 + 0, d_cw0, mask=mask_d)
-    tl.atomic_add(dconv_w_ptr + offs_d*4 + 1, d_cw1, mask=mask_d)
-    tl.atomic_add(dconv_w_ptr + offs_d*4 + 2, d_cw2, mask=mask_d)
-    tl.atomic_add(dconv_w_ptr + offs_d*4 + 3, d_cw3, mask=mask_d)
-    tl.atomic_add(dconv_b_ptr + offs_d,       d_cb,  mask=mask_d)
+            d_cw0 += go0 * ((xp3 - tl.load(mean_ptr + pid_b * L + t - 3)) * tl.load(rstd_ptr + pid_b * L + t - 3)) * nw
+    tl.atomic_add(dnorm_w_ptr + offs_d, d_nw, mask=mask_d); tl.atomic_add(dnorm_b_ptr + offs_d, d_nb, mask=mask_d)
+    tl.atomic_add(dconv_w_ptr + offs_d*4 + 0, d_cw0, mask=mask_d); tl.atomic_add(dconv_w_ptr + offs_d*4 + 1, d_cw1, mask=mask_d)
+    tl.atomic_add(dconv_w_ptr + offs_d*4 + 2, d_cw2, mask=mask_d); tl.atomic_add(dconv_w_ptr + offs_d*4 + 3, d_cw3, mask=mask_d)
+    tl.atomic_add(dconv_b_ptr + offs_d, d_cb, mask=mask_d)
 
 class FusedNormConv1dFunction(torch.autograd.Function):
     @staticmethod
@@ -183,14 +130,16 @@ class FusedNormConv1dFunction(torch.autograd.Function):
         out  = torch.empty_like(x)
         mean = torch.empty((B, L), device=x.device, dtype=torch.bfloat16)
         rstd = torch.empty((B, L), device=x.device, dtype=torch.bfloat16)
-        BLOCK_L, BLOCK_D = 64, triton.next_power_of_2(D)
+        
+        # ⚡ [핵심 교착상태 해결] BLOCK_L을 16으로 줄이고, num_stages=1로 강제하여 컴파일러 파이프라이닝 무한루프 방지
+        BLOCK_L, BLOCK_D = 16, triton.next_power_of_2(D)
         grid = (B, triton.cdiv(L, BLOCK_L))
         _fused_norm_conv_fwd_kernel[grid](
             x, norm_weight, norm_bias, conv_weight, conv_bias,
             out, mean, rstd, B, L, D,
-            x.stride(0), x.stride(1), x.stride(2),
-            out.stride(0), out.stride(1), out.stride(2),
-            eps=eps, BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D, num_warps=8,
+            x.stride(0), x.stride(1), x.stride(2), out.stride(0), out.stride(1), out.stride(2),
+            eps=eps, BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D, 
+            num_warps=4, num_stages=1 # ⚡ PTXAS 기절 방지
         )
         ctx.save_for_backward(x, norm_weight, conv_weight, mean, rstd)
         ctx.eps = eps
@@ -201,17 +150,18 @@ class FusedNormConv1dFunction(torch.autograd.Function):
         x, norm_weight, conv_weight, mean, rstd = ctx.saved_tensors
         B, L, D = x.shape
         dx = torch.empty_like(x)
-        dnorm_w = torch.zeros_like(norm_weight, dtype=torch.float32)
-        dnorm_b = torch.zeros_like(norm_weight, dtype=torch.float32)
+        dnorm_w, dnorm_b = torch.zeros_like(norm_weight, dtype=torch.float32), torch.zeros_like(norm_weight, dtype=torch.float32)
         dconv_w = torch.zeros_like(conv_weight, dtype=torch.float32)
         dconv_b = torch.zeros(conv_weight.shape[0], device=x.device, dtype=torch.float32)
-        BLOCK_L, BLOCK_D = 64, triton.next_power_of_2(D)
+        
+        BLOCK_L, BLOCK_D = 16, triton.next_power_of_2(D)
         grid = (B, triton.cdiv(L, BLOCK_L))
         _fused_norm_conv_bwd_kernel[grid](
             grad_output.contiguous(), x, mean.float(), rstd.float(),
             norm_weight, conv_weight, dx, dnorm_w, dnorm_b, dconv_w, dconv_b,
             B, L, D, x.stride(0), x.stride(1), x.stride(2),
-            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D, num_warps=8,
+            BLOCK_L=BLOCK_L, BLOCK_D=BLOCK_D, 
+            num_warps=4, num_stages=1 # ⚡ PTXAS 기절 방지
         )
         return (dx, dnorm_w.to(x.dtype), dnorm_b.to(x.dtype), dconv_w.to(x.dtype), dconv_b.to(x.dtype), None)
 
@@ -221,16 +171,13 @@ def fused_norm_conv1d_trainable(x, norm_layer, conv_layer):
         conv_layer.weight.squeeze(1).to(x.dtype), conv_layer.bias.to(x.dtype), norm_layer.eps,
     )
 
-# ─── SSM Triton (Auto-tune 제거 버전) ──────────────────────────────────────────
-# @triton.autotune 제거
+# ─── SSM Triton ─────────────────────────────────────────────
 @triton.jit
 def _ssm_intra_v2(
     projs_ptr, y_ssm_ptr, last_state_ptr, chunk_decay_ptr, A_log_ptr,
-    stride_pb, stride_pl, stride_pd,
-    stride_yb, stride_yn, stride_yc, stride_yd,
+    stride_pb, stride_pl, stride_pd, stride_yb, stride_yn, stride_yc, stride_yd,
     stride_lb, stride_ln, stride_ld,
-    D_STATE: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr
+    D_STATE: tl.constexpr, CHUNK_SIZE: tl.constexpr, BLOCK_SIZE_D: tl.constexpr
 ):
     pid_b = tl.program_id(0); pid_n = tl.program_id(1)
     offs_d = tl.arange(0, BLOCK_SIZE_D); mask_d = offs_d < D_STATE
@@ -242,10 +189,7 @@ def _ssm_intra_v2(
         dt_raw = tl.load(projs_ptr + ptr_base + offs_d * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
         x_val  = tl.load(projs_ptr + ptr_base + (D_STATE + offs_d) * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
         b_val  = tl.load(projs_ptr + ptr_base + (D_STATE*2 + offs_d) * stride_pd, mask=mask_d, other=0.0).to(tl.float32)
-        
-        # ⚡ [안정성 유지]
         dt_s = tl.where(dt_raw > 20.0, dt_raw, tl.math.log(1.0 + tl.math.exp(dt_raw)))
-        
         cur_log_decay = dt_s * A_val
         sum_log_decay += cur_log_decay
         acc = acc * tl.math.exp(cur_log_decay) + dt_s * b_val * x_val
@@ -256,8 +200,7 @@ def _ssm_intra_v2(
 @triton.jit
 def _ssm_scan_v2(
     last_state_ptr, global_state_ptr, chunk_decay_ptr,
-    stride_lb, stride_ln, stride_ld,
-    N: tl.constexpr, D_STATE: tl.constexpr
+    stride_lb, stride_ln, stride_ld, N: tl.constexpr, D_STATE: tl.constexpr
 ):
     pid_b = tl.program_id(0); offs_d = tl.arange(0, D_STATE)
     state = tl.zeros((D_STATE,), dtype=tl.float32)
@@ -268,15 +211,12 @@ def _ssm_scan_v2(
         ls    = tl.load(last_state_ptr  + base + offs_d * stride_ld).to(tl.float32)
         state = state * tl.math.exp(decay) + ls
 
-# @triton.autotune 제거
 @triton.jit
 def _ssm_inter_v2(
     projs_ptr, y_ssm_ptr, global_state_ptr, A_log_ptr,
-    stride_pb, stride_pl, stride_pd,
-    stride_yb, stride_yn, stride_yc, stride_yd,
+    stride_pb, stride_pl, stride_pd, stride_yb, stride_yn, stride_yc, stride_yd,
     stride_gb, stride_gn, stride_gd,
-    D_STATE: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr
+    D_STATE: tl.constexpr, CHUNK_SIZE: tl.constexpr, BLOCK_SIZE_D: tl.constexpr
 ):
     pid_b = tl.program_id(0); pid_n = tl.program_id(1)
     offs_d = tl.arange(0, BLOCK_SIZE_D); mask_d = offs_d < D_STATE
@@ -292,13 +232,11 @@ def _ssm_inter_v2(
         y_intra = tl.load(y_ssm_ptr + y_addr, mask=mask_d, other=0.0).to(tl.float32)
         tl.store(y_ssm_ptr + y_addr, (y_intra + g_state * tl.math.exp(cum_log)).to(tl.bfloat16), mask=mask_d)
 
-# ─── Slot Triton (Auto-tune 제거 버전) ────────────────────────────────────────
-# @triton.autotune 제거
+# ─── Slot Triton ──────────────────────────────────────────
 @triton.jit
 def _slot_all_fused(
     projs_ptr, out_ptr, gamma_ptr,
-    stride_pb, stride_pl, stride_pd,
-    stride_ybh, stride_yn, stride_yc, stride_yd,
+    stride_pb, stride_pl, stride_pd, stride_ybh, stride_yn, stride_yc, stride_yd,
     D_MODEL: tl.constexpr, NUM_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
     CHUNK_SIZE: tl.constexpr, N: tl.constexpr, PROJ_OFFSET: tl.constexpr,
     BLOCK_SIZE_C: tl.constexpr, BLOCK_SIZE_D: tl.constexpr
@@ -320,7 +258,6 @@ def _slot_all_fused(
         k_raw = tl.load(projs_ptr + base + (k_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         v = tl.load(projs_ptr + base + (v_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0)
         
-        # ⚡ [핵심 수정 1] ReLU^2 대신 ELU(x)+1
         q_pos = tl.where(q_raw > 0, q_raw + 1.0, tl.math.exp(q_raw))
         k_pos = tl.where(k_raw > 0, k_raw + 1.0, tl.math.exp(k_raw))
         q, k = q_pos.to(v.dtype), k_pos.to(v.dtype)
@@ -334,7 +271,6 @@ def _slot_all_fused(
         k_decayed = (k * k_decay).to(k.dtype)
         running = running * gamma_C + tl.dot(tl.trans(k_decayed), v).to(tl.float32)
 
-# @triton.autotune 제거
 @triton.jit
 def _fused_gnorm_gate_cat_kernel(
     y_slot_ptr, y_ssm_ptr, gate_ptr, out_ptr, gn_weight_ptr, gn_bias_ptr,
@@ -379,11 +315,9 @@ class HdcMamba9v3Block(nn.Module):
         with torch.no_grad():
             dt_init = torch.rand(d_state) * (0.1 - 0.001) + 0.001
             self.in_proj.bias[:d_state] = torch.log(torch.exp(dt_init) - 1.0)
-            
             slot_offset = d_state * 3
             qkv_end = slot_offset + d_model * 3
             nn.init.xavier_uniform_(self.in_proj.weight[slot_offset:qkv_end])
-            
             self.in_proj.bias[qkv_end:].fill_(1.0)
 
         self.A_log = nn.Parameter(torch.log(torch.linspace(0.99, 0.9999, d_state)))
@@ -392,7 +326,6 @@ class HdcMamba9v3Block(nn.Module):
         self.group_norm = nn.GroupNorm(num_heads, d_model)
         self.register_buffer('gamma_buf', torch.exp(-F.softplus(self.decay_log)))
 
-        # ⚡ 런타임 최적화 Config 획득
         self.triton_cfg = get_optimal_triton_config(self.d_state, self.head_dim)
 
     def _inner_forward(self, x):
@@ -400,13 +333,15 @@ class HdcMamba9v3Block(nn.Module):
         C, H, D, ds, dm = self.chunk_size, self.num_heads, self.head_dim, self.d_state, self.d_model
         N, BH = L // C, B * H
         gamma = self.gamma_buf.to(x.dtype)
+        
+        # ⚡ 다시 돌아온 초고속 Fused Triton Conv1d (컴파일러 제어 완료)
         x_conv = fused_norm_conv1d_trainable(x, self.norm, self.conv1d)
+        
         projs = self.in_proj(x_conv)
         y_slot = torch.empty(BH, N, C, D, device=x.device, dtype=x.dtype)
         y_ssm, last_state = torch.empty(B, N, C, ds, device=x.device, dtype=x.dtype), torch.empty(B, N, ds, device=x.device, dtype=x.dtype)
         chunk_decay, global_ssm = torch.empty_like(last_state), torch.empty_like(last_state)
         
-        # ⚡ 하드코딩된 블록 및 워프 수 적용
         _ssm_intra_v2[(B, N)](
             projs, y_ssm, last_state, chunk_decay, self.A_log,
             projs.stride(0), projs.stride(1), projs.stride(2), y_ssm.stride(0), y_ssm.stride(1), y_ssm.stride(2), y_ssm.stride(3), last_state.stride(0), last_state.stride(1), last_state.stride(2),
