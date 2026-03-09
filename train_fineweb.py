@@ -131,13 +131,13 @@ def main():
     
     # ⚡ 최적화된 마이크로 배치 및 학습률 설정
     if args.scale == "130M":
-        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 4, 8, 2e-4
+        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 8, 4, 6e-4
         MAX_STEPS, WARMUP_STEPS = 20000, 100 # 빠른 학습 전환을 위해 워밍업 단축
     elif args.scale == "360M":
-        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 4, 8, 1.5e-4
+        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 4, 8, 4e-4
         MAX_STEPS, WARMUP_STEPS = 80000, 4000
     elif args.scale == "1B":
-        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 2, 16, 8e-5
+        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 2, 16, 2e-4
         MAX_STEPS, WARMUP_STEPS = 200000, 10000
     
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -175,7 +175,7 @@ def main():
             micro_loss_acc += loss.item()
             
         # ⚡ 기울기 청진기 (Grad Norm) 계산 및 로깅
-        total_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        total_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
         step += 1
