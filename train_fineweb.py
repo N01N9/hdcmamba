@@ -17,14 +17,11 @@ try:
 except ImportError:
     Mamba2 = None
 
-# torch.autograd.set_detect_anomaly(True)
-
-
 # =========================================================================
-# 1. 통합 Language Model Factory (아키텍처 스위칭)
+# 1. 통합 Language Model Factory
 # =========================================================================
 class UniversalLM(nn.Module):
-    def __init__(self, arch, scale, vocab_size=32000):
+    def __init__(self, arch, scale, vocab_size=50277):
         super().__init__()
         self.arch = arch
         self.scale = scale
@@ -49,7 +46,6 @@ class UniversalLM(nn.Module):
         
         cfg = configs[scale][arch]
         self.d_model = cfg["d_model"]
-        
         self.embedding = nn.Embedding(vocab_size, self.d_model)
         
         if arch == "HdcMamba":
@@ -64,27 +60,23 @@ class UniversalLM(nn.Module):
             )
             self.backbone = nn.TransformerEncoder(layer, num_layers=cfg["n_layers"])
         elif arch == "Mamba2":
-            if Mamba2 is None:
-                raise ImportError("mamba_ssm 패키지가 설치되지 않았습니다.")
             self.backbone = nn.ModuleList([
                 Mamba2(d_model=self.d_model, d_state=cfg["d_state"]) for _ in range(cfg["n_layers"])
             ])
 
         self.norm_f = nn.LayerNorm(self.d_model)
-        
         self.lm_head = nn.Linear(self.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
 
+        # ⚡ 핀셋 초기화: SSM 내부를 망가뜨리지 않도록 외부 레이어만 초기화
         self._init_weights(self.embedding)
         self._init_weights(self.lm_head)
         self._init_weights(self.norm_f)
 
     def _init_weights(self, module):
-        """표준 LLM 가중치 초기화 (분산 0.02의 정규분포)"""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+            if module.bias is not None: torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
@@ -93,27 +85,22 @@ class UniversalLM(nn.Module):
 
     def forward(self, input_ids):
         x = self.embedding(input_ids)
-        
         if self.arch == "Transformer":
-            seq_len = x.size(1)
-            mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=x.device)
+            mask = nn.Transformer.generate_square_subsequent_mask(x.size(1), device=x.device)
             x = self.backbone(x, mask=mask, is_causal=True)
         elif self.arch == "Mamba2":
-            for layer in self.backbone:
-                x = layer(x)
-        else: # HdcMamba
-            x = self.backbone(x)
-            
-        x = self.norm_f(x)
-        logits = self.lm_head(x)
-        return logits
+            for layer in self.backbone: x = layer(x)
+        else: x = self.backbone(x)
+        return self.lm_head(self.norm_f(x))
 
 # =========================================================================
-# 2. 데이터 로더 (FineWeb-Edu 교체 완료)
+# 2. 데이터 로더 (고속 토크나이징 + 셔플링)
 # =========================================================================
 class FineWebEduIterable(IterableDataset):
     def __init__(self, tokenizer, seq_len=8192, split="train"):
+        # ⚡ 스트리밍 셔플링 추가
         self.dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-100BT", split=split, streaming=True)
+        self.dataset = self.dataset.shuffle(seed=42, buffer_size=10000)
         self.tokenizer = tokenizer
         self.seq_len = seq_len
 
@@ -122,15 +109,10 @@ class FineWebEduIterable(IterableDataset):
         batch_texts = []
         for sample in self.dataset:
             batch_texts.append(sample["text"])
-            
-            # 🔥 핵심: 텍스트를 64개씩 모아서 초고속(Rust 엔진)으로 한 번에 토크나이징
-            if len(batch_texts) >= 64:
+            if len(batch_texts) >= 64: # 64개 문장씩 묶어서 Rust 엔진으로 처리
                 encodings = self.tokenizer(batch_texts, add_special_tokens=True)["input_ids"]
-                for tokens in encodings:
-                    buffer.extend(tokens)
-                batch_texts = [] # 텍스트 버퍼 비우기
-                
-                # 모델 입력 크기(seq_len)만큼 버퍼가 차면 GPU로 발사
+                for tokens in encodings: buffer.extend(tokens)
+                batch_texts = []
                 while len(buffer) >= self.seq_len + 1:
                     chunk = buffer[:self.seq_len + 1]
                     buffer = buffer[self.seq_len:]
@@ -140,111 +122,78 @@ class FineWebEduIterable(IterableDataset):
 # 3. 메인 학습 파이프라인
 # =========================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Multi-Scale Architecture Training")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--arch", type=str, required=True, choices=["Transformer", "Mamba2", "HdcMamba"])
     parser.add_argument("--scale", type=str, required=True, choices=["130M", "360M", "1B"])
     args = parser.parse_args()
 
-    DEVICE = "cuda"
-    DTYPE = torch.bfloat16
-    SEQ_LEN = 8192
+    DEVICE, DTYPE, SEQ_LEN = "cuda", torch.bfloat16, 8192
     
+    # ⚡ 최적화된 마이크로 배치 및 학습률 설정
     if args.scale == "130M":
-        MICRO_BATCH = 4
-        GRAD_ACCUM_STEPS = 8
-        LR = 2e-4
-        MAX_STEPS = 20000
-        WARMUP_STEPS = 1000
+        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 4, 8, 2e-4
+        MAX_STEPS, WARMUP_STEPS = 20000, 100 # 빠른 학습 전환을 위해 워밍업 단축
     elif args.scale == "360M":
-        MICRO_BATCH = 4
-        GRAD_ACCUM_STEPS = 8
-        LR = 1e-4
-        MAX_STEPS = 80000
-        WARMUP_STEPS = 4000
+        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 4, 8, 1.5e-4
+        MAX_STEPS, WARMUP_STEPS = 80000, 4000
     elif args.scale == "1B":
-        MICRO_BATCH = 2
-        GRAD_ACCUM_STEPS = 16
-        LR = 5e-5
-        MAX_STEPS = 200000
-        WARMUP_STEPS = 10000
+        MICRO_BATCH, GRAD_ACCUM_STEPS, LR = 2, 16, 8e-5
+        MAX_STEPS, WARMUP_STEPS = 200000, 10000
     
     torch.backends.cuda.matmul.allow_tf32 = True
+    run_name = f"{args.arch}-{args.scale}-FineWebEdu-Final"
+    wandb.init(project="HdcMamba-Scaling-Laws", name=run_name, config=vars(args))
 
-    run_name = f"{args.arch}-{args.scale}-FineWebEdu"
-    wandb.init(project="HdcMamba-Scaling-Laws", name=run_name, group=args.scale, config={
-        "arch": args.arch, "scale": args.scale, "seq_len": SEQ_LEN,
-        "global_batch_size": MICRO_BATCH * GRAD_ACCUM_STEPS, "lr": LR,
-        "dataset": "FineWeb-Edu-100BT"
-    })
-
-    print(f"⏳ Initializing {run_name} Model with FineWeb-Edu...")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b", use_fast=True)
-    # ⚡ 클래스 이름 변경 반영
-    train_dataset = FineWebEduIterable(tokenizer, seq_len=SEQ_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=MICRO_BATCH, num_workers=0)
+    train_loader = DataLoader(FineWebEduIterable(tokenizer, seq_len=SEQ_LEN), batch_size=MICRO_BATCH, num_workers=0)
 
-    model = UniversalLM(arch=args.arch, scale=args.scale, vocab_size=len(tokenizer))
-    model.to(DEVICE).to(DTYPE)
-    print(f"✅ Total Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f} M")
+    model = UniversalLM(arch=args.arch, scale=args.scale, vocab_size=len(tokenizer)).to(DEVICE).to(DTYPE)
+    print(f"✅ Model Ready: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.1)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=MAX_STEPS)
     loss_fn = nn.CrossEntropyLoss()
 
-    print(f"🔥 Starting Training for {run_name} on A100...")
     model.train()
-    
-    step = 0
-    accumulated_loss = 0.0
+    step, data_iter = 0, iter(train_loader)
     progress_bar = tqdm(total=MAX_STEPS, desc=run_name)
-    data_iter = iter(train_loader)
     
     while step < MAX_STEPS:
         optimizer.zero_grad(set_to_none=True)
+        micro_loss_acc = 0.0
         
         for _ in range(GRAD_ACCUM_STEPS):
-            try:
-                x, y = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                x, y = next(data_iter)
-                
-            x, y = x.to(DEVICE), y.to(DEVICE)
+            try: x, y = next(data_iter)
+            except StopIteration: data_iter = iter(train_loader); x, y = next(data_iter)
             
             with torch.amp.autocast('cuda', dtype=DTYPE):
-                logits = model(x)
-                # ⚡ 1. Loss 계산 직전에 logits를 float32로 캐스팅하여 오버플로우 방지
-                loss = loss_fn(logits.view(-1, logits.size(-1)).float(), y.view(-1))
+                logits = model(x.to(DEVICE))
+                loss = loss_fn(logits.view(-1, logits.size(-1)).float(), y.to(DEVICE).view(-1))
                 loss = loss / GRAD_ACCUM_STEPS
             
             loss.backward()
-            accumulated_loss += loss.item()
+            micro_loss_acc += loss.item()
             
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        # ⚡ 기울기 청진기 (Grad Norm) 계산 및 로깅
+        total_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
         scheduler.step()
-        
         step += 1
-        current_lr = scheduler.get_last_lr()[0]
         
         if step % 10 == 0:
             wandb.log({
-                "train/loss": accumulated_loss,
-                "train/lr": current_lr,
+                "train/loss": micro_loss_acc,
+                "train/grad_norm": total_norm,
+                "train/lr": scheduler.get_last_lr()[0],
                 "train/tokens_seen": step * MICRO_BATCH * GRAD_ACCUM_STEPS * SEQ_LEN,
-                "system/vram_allocated_GB": torch.cuda.max_memory_allocated() / 1e9
+                "system/vram_GB": torch.cuda.max_memory_allocated() / 1e9
             }, step=step)
-            
-            progress_bar.set_postfix({"loss": f"{accumulated_loss:.4f}", "lr": f"{current_lr:.2e}"})
-            
-        accumulated_loss = 0.0
-        progress_bar.update(1)
+            progress_bar.set_postfix({"loss": f"{micro_loss_acc:.4f}", "norm": f"{total_norm:.2f}"})
         
+        progress_bar.update(1)
         if step % 5000 == 0:
-            os.makedirs("checkpoints", exist_ok=True)
             torch.save(model.state_dict(), f"checkpoints/{run_name}_step_{step}.pt")
-            
+
     wandb.finish()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
