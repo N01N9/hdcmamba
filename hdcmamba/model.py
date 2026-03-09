@@ -6,10 +6,46 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # =========================================================================================
-# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Architecture & Initialization Fixed)
+# 👑 HdcMamba-9v3: SSM + Slot (Full Triton, Deadlock Fixed with Heuristic Branching)
 # =========================================================================================
 
-# ─── Fused LayerNorm + Causal Conv1d ──────────────────────────────────────────────────
+# ─── 하드웨어 정보 획득 도구 ────────────────────────────────────────────────────────
+def get_optimal_triton_config(d_state, head_dim):
+    """
+    GPU의 연산 능력(Compute Capability)을 기반으로 안전하고 최적화된
+    Triton 블록 크기 및 워프 수를 반환합니다.
+    """
+    if not torch.cuda.is_available():
+        return {"block_d": 64, "block_c": 128, "warps": 4}
+    
+    cc_major, cc_minor = torch.cuda.get_device_capability()
+    
+    # A100 (Ampere, CC 8.0) 또는 H100 (Hopper, CC 9.0) 등 고성능 GPU
+    if cc_major >= 8:
+        return {
+            "ssm_block_d": max(64, triton.next_power_of_2(d_state)),
+            "ssm_warps": 8,
+            "slot_block_c": 128,
+            "slot_block_d": max(64, triton.next_power_of_2(head_dim)),
+            "slot_warps": 8,
+            "out_block_d_state": max(64, triton.next_power_of_2(d_state)),
+            "out_block_d_head": max(64, triton.next_power_of_2(head_dim)),
+            "out_warps": 8
+        }
+    # T4, V100, RTX 20/30 series 등 (안정성 위주)
+    else:
+        return {
+            "ssm_block_d": max(32, triton.next_power_of_2(d_state)),
+            "ssm_warps": 4,
+            "slot_block_c": 64,
+            "slot_block_d": max(32, triton.next_power_of_2(head_dim)),
+            "slot_warps": 4,
+            "out_block_d_state": max(32, triton.next_power_of_2(d_state)),
+            "out_block_d_head": max(32, triton.next_power_of_2(head_dim)),
+            "out_warps": 4
+        }
+
+# ─── Fused LayerNorm + Causal Conv1d (변경 없음) ───────────────────────────────────
 @triton.jit
 def _fused_norm_conv_fwd_kernel(
     x_ptr, norm_w_ptr, norm_b_ptr, conv_w_ptr, conv_b_ptr,
@@ -185,15 +221,8 @@ def fused_norm_conv1d_trainable(x, norm_layer, conv_layer):
         conv_layer.weight.squeeze(1).to(x.dtype), conv_layer.bias.to(x.dtype), norm_layer.eps,
     )
 
-# ─── SSM Triton ─────────────────────────────────────────────
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_D': 32}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 64}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 128}, num_warps=8),
-    ],
-    key=['D_STATE'],
-)
+# ─── SSM Triton (Auto-tune 제거 버전) ──────────────────────────────────────────
+# @triton.autotune 제거
 @triton.jit
 def _ssm_intra_v2(
     projs_ptr, y_ssm_ptr, last_state_ptr, chunk_decay_ptr, A_log_ptr,
@@ -239,14 +268,7 @@ def _ssm_scan_v2(
         ls    = tl.load(last_state_ptr  + base + offs_d * stride_ld).to(tl.float32)
         state = state * tl.math.exp(decay) + ls
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_D': 32}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 64}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 128}, num_warps=8),
-    ],
-    key=['D_STATE'],
-)
+# @triton.autotune 제거
 @triton.jit
 def _ssm_inter_v2(
     projs_ptr, y_ssm_ptr, global_state_ptr, A_log_ptr,
@@ -270,15 +292,8 @@ def _ssm_inter_v2(
         y_intra = tl.load(y_ssm_ptr + y_addr, mask=mask_d, other=0.0).to(tl.float32)
         tl.store(y_ssm_ptr + y_addr, (y_intra + g_state * tl.math.exp(cum_log)).to(tl.bfloat16), mask=mask_d)
 
-# ─── Slot Triton ──────────────────────────────────────────
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_C': 64,  'BLOCK_SIZE_D': 64},  num_warps=4),
-        triton.Config({'BLOCK_SIZE_C': 128, 'BLOCK_SIZE_D': 64},  num_warps=8),
-        triton.Config({'BLOCK_SIZE_C': 128, 'BLOCK_SIZE_D': 128}, num_warps=8),
-    ],
-    key=['CHUNK_SIZE', 'HEAD_DIM'],
-)
+# ─── Slot Triton (Auto-tune 제거 버전) ────────────────────────────────────────
+# @triton.autotune 제거
 @triton.jit
 def _slot_all_fused(
     projs_ptr, out_ptr, gamma_ptr,
@@ -305,8 +320,7 @@ def _slot_all_fused(
         k_raw = tl.load(projs_ptr + base + (k_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
         v = tl.load(projs_ptr + base + (v_off + offs_d[None, :]) * stride_pd, mask=mask_c[:, None] & mask_d[None, :], other=0.0)
         
-        # ⚡ [핵심 수정 1] ReLU^2 대신 ELU(x)+1 을 사용하여 죽은 가지(Dead Branch) 완벽히 부활
-        # 음수 영역에서도 기울기가 살아있으며, 결과값은 항상 양수(>0)를 보장합니다.
+        # ⚡ [핵심 수정 1] ReLU^2 대신 ELU(x)+1
         q_pos = tl.where(q_raw > 0, q_raw + 1.0, tl.math.exp(q_raw))
         k_pos = tl.where(k_raw > 0, k_raw + 1.0, tl.math.exp(k_raw))
         q, k = q_pos.to(v.dtype), k_pos.to(v.dtype)
@@ -320,12 +334,7 @@ def _slot_all_fused(
         k_decayed = (k * k_decay).to(k.dtype)
         running = running * gamma_C + tl.dot(tl.trans(k_decayed), v).to(tl.float32)
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_D_STATE': 64, 'BLOCK_SIZE_D_HEAD': 64}, num_warps=8),
-    ],
-    key=['D_STATE', 'HEAD_DIM'],
-)
+# @triton.autotune 제거
 @triton.jit
 def _fused_gnorm_gate_cat_kernel(
     y_slot_ptr, y_ssm_ptr, gate_ptr, out_ptr, gn_weight_ptr, gn_bias_ptr,
@@ -353,7 +362,6 @@ def _fused_gnorm_gate_cat_kernel(
 # HdcMamba9v3Block
 # =========================================================================================
 class HdcMamba9v3Block(nn.Module):
-    # ⚡ [핵심 수정 4] Chunk Size 기본값을 256으로 늘려 Attention Window 확장
     def __init__(self, d_model=512, d_state=64, num_heads=8, chunk_size=256):
         super().__init__()
         self.d_model, self.d_state, self.num_heads, self.chunk_size = d_model, d_state, num_heads, chunk_size
@@ -362,33 +370,30 @@ class HdcMamba9v3Block(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=4, groups=d_model, padding=3, bias=True)
         with torch.no_grad():
-            # ⚡ Conv 초기화를 Identity에 작은 노이즈를 더해 gradient 흐름 유도
             nn.init.normal_(self.conv1d.weight, std=0.02)
             self.conv1d.weight[:, 0, -1] += 1.0 
             self.conv1d.bias.fill_(0.0)
             
-        # ⚡ [핵심 수정 2] bias=True 로 변경하여 dt와 gate의 초기 스케일을 조절합니다.
         self.in_proj = nn.Linear(d_model, d_state * 3 + d_model * 4, bias=True)
         
         with torch.no_grad():
-            # 1. dt bias 초기화 (SSM이 너무 빨리 망각하지 않도록)
             dt_init = torch.rand(d_state) * (0.1 - 0.001) + 0.001
             self.in_proj.bias[:d_state] = torch.log(torch.exp(dt_init) - 1.0)
             
-            # 2. Slot QKV 스케일 키우기 (std=0.08 수준 효과)
             slot_offset = d_state * 3
             qkv_end = slot_offset + d_model * 3
             nn.init.xavier_uniform_(self.in_proj.weight[slot_offset:qkv_end])
             
-            # 3. Gate Bias 열기 (sigmoid(1.0) ~ 0.73)
             self.in_proj.bias[qkv_end:].fill_(1.0)
 
-        # ⚡ [핵심 수정 3] SSM Decay 완화 (0.9 ~ 0.999 -> 0.99 ~ 0.9999)
         self.A_log = nn.Parameter(torch.log(torch.linspace(0.99, 0.9999, d_state)))
         self.decay_log = nn.Parameter(torch.log(torch.ones(num_heads) * 0.05))
         self.out_proj = nn.Linear(d_state + d_model, d_model, bias=False)
         self.group_norm = nn.GroupNorm(num_heads, d_model)
         self.register_buffer('gamma_buf', torch.exp(-F.softplus(self.decay_log)))
+
+        # ⚡ 런타임 최적화 Config 획득
+        self.triton_cfg = get_optimal_triton_config(self.d_state, self.head_dim)
 
     def _inner_forward(self, x):
         B, L, _ = x.shape
@@ -400,15 +405,45 @@ class HdcMamba9v3Block(nn.Module):
         y_slot = torch.empty(BH, N, C, D, device=x.device, dtype=x.dtype)
         y_ssm, last_state = torch.empty(B, N, C, ds, device=x.device, dtype=x.dtype), torch.empty(B, N, ds, device=x.device, dtype=x.dtype)
         chunk_decay, global_ssm = torch.empty_like(last_state), torch.empty_like(last_state)
-        _ssm_intra_v2[(B, N)](projs, y_ssm, last_state, chunk_decay, self.A_log, projs.stride(0), projs.stride(1), projs.stride(2), y_ssm.stride(0), y_ssm.stride(1), y_ssm.stride(2), y_ssm.stride(3), last_state.stride(0), last_state.stride(1), last_state.stride(2), D_STATE=ds, CHUNK_SIZE=C)
-        _ssm_scan_v2[(B,)](last_state, global_ssm, chunk_decay, last_state.stride(0), last_state.stride(1), last_state.stride(2), N=N, D_STATE=ds, num_warps=4)
-        _ssm_inter_v2[(B, N)](projs, y_ssm, global_ssm, self.A_log, projs.stride(0), projs.stride(1), projs.stride(2), y_ssm.stride(0), y_ssm.stride(1), y_ssm.stride(2), y_ssm.stride(3), global_ssm.stride(0), global_ssm.stride(1), global_ssm.stride(2), D_STATE=ds, CHUNK_SIZE=C)
-        slot_offset = ds * 3
-        _slot_all_fused[(BH,)](projs, y_slot, gamma, projs.stride(0), projs.stride(1), projs.stride(2), y_slot.stride(0), y_slot.stride(1), y_slot.stride(2), y_slot.stride(3), D_MODEL=dm, NUM_HEADS=H, HEAD_DIM=D, CHUNK_SIZE=C, N=N, PROJ_OFFSET=slot_offset)
-        gate, combined = projs[..., slot_offset + dm * 3:], torch.empty(B, L, ds + dm, device=x.device, dtype=x.dtype)
-        _fused_gnorm_gate_cat_kernel[(B * L,)](y_slot, y_ssm.view(B, L, ds), gate, combined, self.group_norm.weight, self.group_norm.bias, y_slot.stride(0), y_slot.stride(1), y_slot.stride(2), y_slot.stride(3), B*L, ds, 1, B*L, dm*4, 1, combined.stride(0), combined.stride(1), combined.stride(2), B=B, NUM_HEADS=H, HEAD_DIM=D, D_MODEL=dm, D_STATE=ds, L=L)
         
-        # 정규화를 통해 폭발을 잡으면서도 Gradient 흐름은 살려둠
+        # ⚡ 하드코딩된 블록 및 워프 수 적용
+        _ssm_intra_v2[(B, N)](
+            projs, y_ssm, last_state, chunk_decay, self.A_log,
+            projs.stride(0), projs.stride(1), projs.stride(2), y_ssm.stride(0), y_ssm.stride(1), y_ssm.stride(2), y_ssm.stride(3), last_state.stride(0), last_state.stride(1), last_state.stride(2),
+            D_STATE=ds, CHUNK_SIZE=C,
+            BLOCK_SIZE_D=self.triton_cfg["ssm_block_d"], num_warps=self.triton_cfg["ssm_warps"]
+        )
+        
+        _ssm_scan_v2[(B,)](
+            last_state, global_ssm, chunk_decay,
+            last_state.stride(0), last_state.stride(1), last_state.stride(2),
+            N=N, D_STATE=ds, num_warps=4
+        )
+        
+        _ssm_inter_v2[(B, N)](
+            projs, y_ssm, global_ssm, self.A_log,
+            projs.stride(0), projs.stride(1), projs.stride(2), y_ssm.stride(0), y_ssm.stride(1), y_ssm.stride(2), y_ssm.stride(3), global_ssm.stride(0), global_ssm.stride(1), global_ssm.stride(2),
+            D_STATE=ds, CHUNK_SIZE=C,
+            BLOCK_SIZE_D=self.triton_cfg["ssm_block_d"], num_warps=self.triton_cfg["ssm_warps"]
+        )
+        
+        slot_offset = ds * 3
+        _slot_all_fused[(BH,)](
+            projs, y_slot, gamma,
+            projs.stride(0), projs.stride(1), projs.stride(2), y_slot.stride(0), y_slot.stride(1), y_slot.stride(2), y_slot.stride(3),
+            D_MODEL=dm, NUM_HEADS=H, HEAD_DIM=D, CHUNK_SIZE=C, N=N, PROJ_OFFSET=slot_offset,
+            BLOCK_SIZE_C=self.triton_cfg["slot_block_c"], BLOCK_SIZE_D=self.triton_cfg["slot_block_d"], num_warps=self.triton_cfg["slot_warps"]
+        )
+        
+        gate, combined = projs[..., slot_offset + dm * 3:], torch.empty(B, L, ds + dm, device=x.device, dtype=x.dtype)
+        
+        _fused_gnorm_gate_cat_kernel[(B * L,)](
+            y_slot, y_ssm.view(B, L, ds), gate, combined, self.group_norm.weight, self.group_norm.bias,
+            y_slot.stride(0), y_slot.stride(1), y_slot.stride(2), y_slot.stride(3), B*L, ds, 1, B*L, dm*4, 1, combined.stride(0), combined.stride(1), combined.stride(2),
+            B=B, NUM_HEADS=H, HEAD_DIM=D, D_MODEL=dm, D_STATE=ds, L=L,
+            BLOCK_SIZE_D_STATE=self.triton_cfg["out_block_d_state"], BLOCK_SIZE_D_HEAD=self.triton_cfg["out_block_d_head"], num_warps=self.triton_cfg["out_warps"]
+        )
+        
         combined = F.layer_norm(combined.float(), (ds + dm,)).to(x.dtype)
         result = self.out_proj(combined)
         return result
@@ -426,7 +461,6 @@ class HdcMamba9v3Block(nn.Module):
 class HdcMamba9v3Model(nn.Module):
     def __init__(self, d_model, n_layers, d_state, num_slots, num_heads=8):
         super().__init__()
-        # chunk_size를 256으로 늘려 호출
         self.layers = nn.ModuleList([HdcMamba9v3Block(d_model=d_model, d_state=d_state, num_heads=num_heads, chunk_size=256) for _ in range(n_layers)])
         self.norm_final = nn.LayerNorm(d_model)
 
